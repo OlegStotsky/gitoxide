@@ -8,7 +8,7 @@ use crate::{
     bstr::{BStr, ByteSlice},
     config::{
         cache::util::ApplyLeniencyDefault,
-        tree::{Branch, Push},
+        tree::{Branch, Push, Remote},
     },
     push, remote,
 };
@@ -53,14 +53,7 @@ impl crate::Repository {
                         Branch::MERGE.name,
                         self.filter_config_section(),
                     )
-                    .map(|name| {
-                        if name.starts_with(b"refs/") {
-                            crate::config::tree::branch::Merge::try_into_fullrefname(name)
-                        } else {
-                            gix_ref::Category::LocalBranch.to_full_name(name.as_bstr()).or_error()
-                        }
-                        .or_raise(|| validation("The configured name of the remote ref to merge wasn't valid"))
-                    })
+                    .map(merge_ref_name)
             }
             remote::Direction::Push => {
                 let remote = match self.branch_remote_or_default(name, direction)? {
@@ -83,7 +76,8 @@ impl crate::Repository {
                         },
                     }
                 } else {
-                    matching_remote(name, remote.push_specs.iter()).map(|res| res.or_error())
+                    matching_remote(name, remote.push_specs.iter().map(gix_refspec::RefSpec::to_ref))
+                        .map(|res| res.or_error())
                 }
             }
         }
@@ -95,6 +89,8 @@ impl crate::Repository {
     /// * with `remote` being [remote::Direction::Fetch], we return the tracking branch that is on the destination
     ///   side of a `src:dest` refspec. For instance, with `name` being `main` and the default refspec
     ///   `refs/heads/*:refs/remotes/origin/*`, `refs/heads/main` would match and produce `refs/remotes/origin/main`.
+    ///   Use the first configured `branch.<name>.merge` entry. If the remote is `.` and there is no mapping,
+    ///   use that entry as a local reference name.
     /// * with `remote` being [remote::Direction::Push], we return the tracking branch that corresponds to the remote
     ///   branch that we would push to. For instance, with `name` being `main`, `push.default=current`,
     ///   and an `origin` remote but no branch-specific configuration, we
@@ -105,6 +101,7 @@ impl crate::Repository {
     ///
     /// Note that if there is an ambiguity, that is if `name` maps to multiple tracking branches, the first matching mapping
     /// is returned, according to the order in which the fetch or push refspecs occur in the configuration file.
+    /// Only [trusted configuration sections](crate::open::Options::filter_config_section()) are considered.
     ///
     /// See also [`Reference::remote_tracking_ref_name()`](crate::Reference::remote_tracking_ref_name()).
     #[doc(alias = "branch_upstream_name", alias = "git2")]
@@ -113,6 +110,11 @@ impl crate::Repository {
         name: &FullNameRef,
         direction: remote::Direction,
     ) -> Option<Result<FullName>> {
+        if direction == remote::Direction::Fetch {
+            return self
+                .upstream_tracking_ref_name(name, self.filter_config_section())
+                .transpose();
+        }
         let remote_ref = match self.branch_remote_ref_name(name, direction)? {
             Ok(r) => r,
             Err(err) => {
@@ -130,7 +132,7 @@ impl crate::Repository {
             }
         };
 
-        let push_default = if direction == remote::Direction::Push && remote.push_specs.is_empty() {
+        let push_default = if remote.push_specs.is_empty() {
             match self.push_default() {
                 Ok(value) => Some(value),
                 Err(err) => return Some(Err(err)),
@@ -141,7 +143,10 @@ impl crate::Repository {
         if push_default == Some(push::Default::Upstream) {
             return self.branch_remote_tracking_ref_name(name, remote::Direction::Fetch);
         }
-        let tracking = match matching_remote(remote_ref.as_ref(), remote.fetch_specs.iter())? {
+        let tracking = match matching_remote(
+            remote_ref.as_ref(),
+            remote.fetch_specs.iter().map(gix_refspec::RefSpec::to_ref),
+        )? {
             Ok(name) => name,
             Err(err) => {
                 return Some(Err(
@@ -157,6 +162,57 @@ impl crate::Repository {
             }
         }
         Some(Ok(tracking))
+    }
+
+    /// Resolve the local reference name that tracks the upstream of branch `name`, such as `refs/heads/main`.
+    /// Return the configured name even if the tracking reference is missing.
+    /// Return `None` for other reference categories or when there is no configured mapping.
+    ///
+    /// Read only the branch's remote, its first merge entry, and the remote's fetch refspecs. A remote of `.`
+    /// uses the merge entry as a local ref if no fetch refspec maps it.
+    /// These settings are used as local metadata, including in reduced-trust repositories. An explicit
+    /// [section filter](crate::open::Options::filter_config_section()) still applies.
+    pub fn branch_upstream_tracking_ref_name(&self, name: &FullNameRef) -> Result<Option<FullName>> {
+        if name.category() != Some(gix_ref::Category::LocalBranch) {
+            return Ok(None);
+        }
+        let filter = self.open_options().filter_config_section.unwrap_or(|_| true);
+        self.upstream_tracking_ref_name(name, filter)
+    }
+
+    fn upstream_tracking_ref_name(
+        &self,
+        branch: &FullNameRef,
+        filter: fn(&gix_config::file::Metadata) -> bool,
+    ) -> Result<Option<FullName>> {
+        let config = &self.config.resolved;
+        let branch = branch.shorten();
+        let Some(remote) = config.string_filter_by("branch", branch, Branch::REMOTE.name, filter) else {
+            return Ok(None);
+        };
+        let Some(merge) = config
+            .strings_filter_by("branch", branch, Branch::MERGE.name, filter)
+            .and_then(|values| values.into_iter().next())
+        else {
+            return Ok(None);
+        };
+        let merge = merge_ref_name(merge)?;
+        let specs = config
+            .strings_filter_by("remote", remote.as_bstr(), Remote::FETCH.name, filter)
+            .unwrap_or_default();
+        let specs = specs
+            .iter()
+            .map(|spec| {
+                gix_refspec::parse(spec.as_bstr(), gix_refspec::parse::Operation::Fetch).or_raise(|| {
+                    validation(format!("Could not parse fetch refspec for remote '{remote}'"))
+                        .with_input(spec.as_bstr())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let tracking = matching_remote(merge.as_ref(), specs)
+            .transpose()
+            .or_raise(|| message("The name of the tracking reference was invalid"))?;
+        Ok(tracking.or_else(|| (remote == ".").then_some(merge)))
     }
 
     /// Given a local `tracking_branch` name, find the remote that maps to it along with the name of the branch on
@@ -286,6 +342,15 @@ impl crate::Repository {
     }
 }
 
+fn merge_ref_name(name: crate::bstr::BString) -> Result<FullName> {
+    if name.starts_with(b"refs/") {
+        FullName::try_from(name)
+    } else {
+        gix_ref::Category::LocalBranch.to_full_name(name.as_bstr())
+    }
+    .or_raise(|| validation("The configured name of the remote ref to merge wasn't valid"))
+}
+
 fn source_ref_to_full_name(source: gix_refspec::match_group::SourceRef<'_>) -> Result<FullName> {
     match source {
         gix_refspec::match_group::SourceRef::FullName(name) => gix_ref::FullName::try_from(name.into_owned())
@@ -298,14 +363,10 @@ fn source_ref_to_full_name(source: gix_refspec::match_group::SourceRef<'_>) -> R
 
 fn matching_remote<'a>(
     lhs: &FullNameRef,
-    specs: impl IntoIterator<Item = &'a gix_refspec::RefSpec>,
+    specs: impl IntoIterator<Item = gix_refspec::RefSpecRef<'a>>,
 ) -> Option<std::result::Result<FullName, gix_validate::reference::name::Error>> {
     let search = gix_refspec::MatchGroup {
-        specs: specs
-            .into_iter()
-            .map(gix_refspec::RefSpec::to_ref)
-            .filter(|spec| spec.source().is_some() && spec.destination().is_some())
-            .collect(),
+        specs: specs.into_iter().collect(),
     };
     let out = search.match_lhs(
         Some(gix_refspec::match_group::Item {
@@ -317,6 +378,7 @@ fn matching_remote<'a>(
     );
     out.mappings
         .into_iter()
-        .next()
-        .and_then(|m| m.rhs.map(|name| FullName::try_from(name.into_owned())))
+        .filter(|mapping| mapping.item_index.is_some())
+        .find_map(|mapping| mapping.rhs)
+        .map(|name| FullName::try_from(name.into_owned()))
 }

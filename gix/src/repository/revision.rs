@@ -221,6 +221,29 @@ impl crate::Repository {
         self.ahead_behind_counts_with_graph(tip_commit_id, base_commit_id, &mut graph)
     }
 
+    /// Count commits unique to the checked-out branch and its upstream, as in
+    /// `git rev-list --left-right --count HEAD...@{upstream}`.
+    ///
+    /// Return `None` for a detached or unborn HEAD, or if the branch's upstream is unconfigured, unmapped, or missing.
+    /// Invalid tracking configuration and failures reading refs or history are errors.
+    ///
+    /// This query uses local refs, objects, and
+    /// [tracking metadata](Self::branch_upstream_tracking_ref_name()), including in reduced-trust repositories.
+    #[cfg(feature = "revision")]
+    pub fn head_ahead_behind_counts(&self) -> Result<Option<gix_revision::ahead_behind_counts::Outcome>> {
+        let Some(mut branch) = self.head_ref()? else {
+            return Ok(None);
+        };
+        let Some(upstream_name) = self.branch_upstream_tracking_ref_name(branch.name())? else {
+            return Ok(None);
+        };
+        let Some(mut upstream) = self.try_find_reference(upstream_name.as_ref())? else {
+            return Ok(None);
+        };
+        self.ahead_behind_counts(branch.peel_to_id()?, upstream.peel_to_id()?)
+            .map(Some)
+    }
+
     /// Like [`ahead_behind_counts()`](Self::ahead_behind_counts()), but reuses cached commits in `graph`.
     /// Its flags are automatically cleared. Traversal failures are returned as errors.
     ///
