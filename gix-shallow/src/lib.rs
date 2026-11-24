@@ -10,7 +10,7 @@
 //! # let shallow_file = dir.path().join("shallow");
 //! # std::fs::write(&shallow_file, format!("{first}\n"))?;
 //!
-//! let shallow = gix_shallow::read(&shallow_file)
+//! let shallow = gix_shallow::read(&shallow_file, first.kind())
 //!     ?
 //!     .expect("a shallow boundary");
 //! let lock = gix_lock::File::acquire_to_update_resource(
@@ -23,7 +23,7 @@
 //! gix_shallow::write(lock, Some(shallow), &[gix_shallow::Update::Shallow(second)])
 //!     ?;
 //!
-//! let ids = gix_shallow::read(&shallow_file)
+//! let ids = gix_shallow::read(&shallow_file, first.kind())
 //!     ?
 //!     .expect("a shallow boundary")
 //!     .into_iter()
@@ -47,12 +47,18 @@ pub enum Update {
 
 /// Return a list of shallow commits as unconditionally read from `shallow_file`.
 ///
+/// Like Git, decode the first [`object_hash.len_in_hex()`][gix_hash::Kind::len_in_hex]
+/// bytes of each record and ignore trailing bytes. `object_hash` is the repository's object format.
+///
 /// The list of shallow commits represents the shallow boundary, beyond which we are lacking all (parent) commits.
 /// Note that the list is never empty, as `Ok(None)` is returned in that case indicating the repository
 /// isn't a shallow clone.
-pub fn read(shallow_file: &std::path::Path) -> Result<Option<nonempty::NonEmpty<gix_hash::ObjectId>>> {
+pub fn read(
+    shallow_file: &std::path::Path,
+    object_hash: gix_hash::Kind,
+) -> Result<Option<nonempty::NonEmpty<gix_hash::ObjectId>>> {
     use bstr::ByteSlice;
-    use gix_error::{ErrorExt, ResultExt, bail, message};
+    use gix_error::{ErrorExt, OptionExt, ResultExt, bail, corruption, message};
     let buf = match std::fs::read(shallow_file) {
         Ok(buf) => buf,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -61,11 +67,19 @@ pub fn read(shallow_file: &std::path::Path) -> Result<Option<nonempty::NonEmpty<
         }
     };
 
+    let hex_len = object_hash.len_in_hex();
     let mut commits = buf
-        .lines()
-        .map(gix_hash::ObjectId::from_hex)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .or_raise(|| gix_error::corruption("Could not decode a line in shallow file as hex-encoded object hash"))?;
+        .lines_with_terminator()
+        // Git reads each record with fgets() into a 1024-byte buffer including the NUL terminator.
+        .flat_map(|line| line.chunks(1023))
+        .map(|record| {
+            let hex = record
+                .get(..hex_len)
+                .ok_or_raise(|| message!("Expected {hex_len} hexadecimal characters in the shallow record"))?;
+            gix_hash::ObjectId::from_hex(hex)
+        })
+        .collect::<Result<Vec<_>>>()
+        .or_raise(|| corruption("Could not decode a line in shallow file as hex-encoded object hash"))?;
 
     commits.sort();
     Ok(nonempty::NonEmpty::from_vec(commits))
